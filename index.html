@@ -144,6 +144,7 @@
     }
     .badge.fill { background: #fff; color: #000; }
     .badge.outline { background: transparent; color: #fff; border-width: 1px; }
+    .badge.sim { background: transparent; color: #fff; border-style: dashed; }
 
     /* Charts */
     .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
@@ -570,6 +571,96 @@
     summarization: 'SUMMARIZATION', ner: 'NER', code_debug: 'CODE DEBUG', code_gen: 'CODE GEN',
   };
 
+  /* ------------------------------------------------------------
+     Illustrative answer heuristics for prompts that don't match a
+     cached task. These are simple, deterministic, client-side rules
+     — NOT the real Gemma/Fireworks model — and are always shown
+     behind a visible "SIMULATED" badge so they're never mistaken
+     for a genuine model output.
+     ------------------------------------------------------------ */
+  function extractNumbers(s) { return (s.match(/-?\d+(?:\.\d+)?/g) || []).map(Number); }
+
+  function simulateMath(p) {
+    let m = p.match(/\$?(\d+(?:\.\d+)?)[^%\d]{0,30}discount(?:ed)?\s*(?:by)?\s*(\d+(?:\.\d+)?)\s*%/i);
+    if (m) {
+      const base = parseFloat(m[1]), pct = parseFloat(m[2]);
+      return '$' + (base * (1 - pct / 100)).toFixed(2);
+    }
+    m = p.match(/average of ([\d,.\s]*?and\s+)?([\d,.\s]+)/i);
+    if (m) {
+      const nums = extractNumbers(m[0]);
+      if (nums.length > 1) return String(Number((nums.reduce((a, b) => a + b, 0) / nums.length).toFixed(4)));
+    }
+    m = p.match(/(\d+(?:\.\d+)?)\s*km\/h.*?(\d+(?:\.\d+)?)\s*hours?/i);
+    if (m) return (parseFloat(m[1]) * parseFloat(m[2])).toFixed(0) + ' kilometers';
+    m = p.match(/(-?\d+(?:\.\d+)?)\s*([-+*/])\s*(-?\d+(?:\.\d+)?)/);
+    if (m) {
+      const a = parseFloat(m[1]), op = m[2], b = parseFloat(m[3]);
+      const r = op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : (b !== 0 ? a / b : NaN);
+      if (!isNaN(r)) return String(Number(r.toFixed(4)));
+    }
+    return null;
+  }
+
+  const POS_WORDS = ['love', 'loved', 'great', 'amazing', 'excellent', 'fantastic', 'wonderful', 'masterpiece', 'best', 'happy', 'good', 'enjoyed'];
+  const NEG_WORDS = ['hate', 'hated', 'terrible', 'awful', 'worst', 'bad', 'horrible', 'disappointing', 'boring', 'poor'];
+  function simulateSentiment(p) {
+    const lower = p.toLowerCase();
+    const pos = POS_WORDS.find(w => lower.includes(w));
+    const neg = NEG_WORDS.find(w => lower.includes(w));
+    if (pos && !neg) return `Positive — keyword match: "${pos}"`;
+    if (neg && !pos) return `Negative — keyword match: "${neg}"`;
+    if (pos && neg) return `Mixed — both positive ("${pos}") and negative ("${neg}") cues found`;
+    return null;
+  }
+
+  function simulateClassification(p) {
+    const m = p.match(/\bas\b\s+([a-z][\w\s,]+?)(?:\.|:|$)/i);
+    if (m) {
+      const parts = m[1].split(/,|\bor\b/i).map(s => s.trim()).filter(Boolean);
+      if (parts.length) return parts[0];
+    }
+    return null;
+  }
+
+  function simulateExtraction(p) {
+    let m = p.match(/\$[\d,]+(?:\.\d+)?/);
+    if (m) return m[0];
+    m = p.match(/"([^"]+)"|'([^']+)'/);
+    if (m) return m[1] || m[2];
+    return null;
+  }
+
+  function simulateNER(p) {
+    const matches = p.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g) || [];
+    const stop = new Set(['The', 'A', 'An', 'In', 'On', 'At', 'Is', 'Extract', 'List', 'Give', 'What', 'Who', 'This']);
+    const uniq = [...new Set(matches.filter(w => !stop.has(w.split(' ')[0])))].slice(0, 4);
+    return uniq.length ? uniq.map(w => `* ${w}`).join('\n') : null;
+  }
+
+  function simulateSummary(p) {
+    let text = p;
+    const q = p.match(/'([^']{20,})'|"([^"]{20,})"/);
+    if (q) text = q[1] || q[2];
+    const m = text.match(/[^.!?]+[.!?]/);
+    return m ? m[0].trim() : null;
+  }
+
+  const SIMULATORS = {
+    math: simulateMath,
+    sentiment: simulateSentiment,
+    classification: simulateClassification,
+    extraction: simulateExtraction,
+    ner: simulateNER,
+    summarization: simulateSummary,
+  };
+  const NO_HEURISTIC_TEXT = '[NO LIGHTWEIGHT HEURISTIC AVAILABLE FOR THIS TYPE/PROMPT — A REAL ANSWER REQUIRES THE ACTUAL GEMMA/FIREWORKS MODEL]';
+  function simulateAnswer(type, promptText) {
+    const fn = SIMULATORS[type];
+    const result = fn ? fn(promptText) : null;
+    return result === null || result === undefined ? NO_HEURISTIC_TEXT : result;
+  }
+
   const normPrompt = (s) => oneLine(s).toLowerCase();
 
   const ROUTER_EXAMPLES = [
@@ -653,15 +744,20 @@
           </div>
           <pre class="mt12">${esc(matched.answer)}</pre>`;
       } else {
+        const simAnswer = simulateAnswer(type, text);
         verdictBody = `
           PREDICTED ROUTE: <span class="badge">LOCAL FIRST</span> — GEMMA-3-4B-IT (Q4_K_M) · 0 TOKENS PROJECTED<br><br>
           <div class="verdict-note">
           IN LOCAL-FIRST MODE, EVERY QUERY IS SAMPLED FROM THE LOCAL MODEL FIRST. IT ONLY ESCALATES TO
           FIREWORKS (SPENDING REAL TOKENS) IF THE GATE ABOVE TRIPS: LOW CONFIDENCE, A FORMAT VETO, OR A
           LOCAL TIMEOUT.<br><br>
-          THIS IS A STATIC, CACHED-RESULTS DEMO — NO MODEL RUNS IN YOUR BROWSER, SO NO CONFIDENCE SCORE OR
-          ANSWER IS FABRICATED FOR NOVEL PROMPTS. THE CLASSIFICATION AND GATE LOGIC ABOVE ARE THE REAL
-          PRODUCTION RULES (src/cheaproute/tasktype.py, config.yaml) — ONLY THE INFERENCE STEP IS NOT RUN HERE.
+          THIS IS A STATIC, CACHED-RESULTS DEMO — NO MODEL RUNS IN YOUR BROWSER. THE CLASSIFICATION AND GATE
+          LOGIC ABOVE ARE THE REAL PRODUCTION RULES (src/cheaproute/tasktype.py, config.yaml) — ONLY THE
+          INFERENCE STEP IS NOT RUN HERE.
+          </div>
+          <div class="detail-block mt12">
+            <span class="badge sim">SIMULATED — NOT FROM THE REAL MODEL</span>
+            <pre class="mt12">${esc(simAnswer)}</pre>
           </div>`;
       }
       const step4 = stepPanel(4, 'VERDICT', verdictBody);
